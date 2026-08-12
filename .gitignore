@@ -1,0 +1,12 @@
+# Entornos virtuales
+venv/
+__pycache__/
+*.pyc
+
+# Datos (no subir PDFs ni Excels generados)
+pdfs/
+excels/
+
+# Sistema
+.DS_Store
+Thumbs.db
