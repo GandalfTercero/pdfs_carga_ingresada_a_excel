@@ -19,15 +19,16 @@ def procesar_pdf(ruta_pdf, carpeta_salida):
     """PDF -> texto -> datos -> Excel."""
     print(f"Procesando: {ruta_pdf.name}")
 
+    log = []  # <-- NUEVO: acumulador de errores/advertencias
     paginas = extraer_texto_pdf(ruta_pdf)
-    datos = parsear_paginas(paginas)
+    datos = parsear_paginas(paginas, log=log)  # <-- NUEVO: pasa el log
 
     if not datos:
         print(f"  No se encontraron datos en {ruta_pdf.name}")
         return 0
 
     nombre_salida = carpeta_salida / f"{ruta_pdf.stem}.xlsx"
-    total_filas = guardar_excel(datos, nombre_salida)
+    total_filas = guardar_excel(datos, nombre_salida, log=log)  # <-- NUEVO: pasa el log
 
     print(f"  {total_filas} filas -> {nombre_salida.name}")
     return total_filas
@@ -61,13 +62,16 @@ def main():
     print(f"{len(archivos_pdf)} PDF(s) encontrado(s)\n")
 
     todos_los_datos = []
+    todos_los_logs = []  # <-- NUEVO: acumular logs de todos los PDFs
     total_general = 0
 
     for pdf in archivos_pdf:
         if args.consolidar:
+            log = []  # <-- NUEVO
             paginas = extraer_texto_pdf(pdf)
-            datos = parsear_paginas(paginas)
+            datos = parsear_paginas(paginas, log=log)  # <-- NUEVO: pasa el log
             todos_los_datos.extend(datos)
+            todos_los_logs.extend(log)  # <-- NUEVO: acumula el log
             total_general += len(datos)
             print(f"  {pdf.name}: {len(datos)} filas")
         else:
@@ -75,7 +79,7 @@ def main():
 
     if args.consolidar and todos_los_datos:
         nombre_consolidado = carpeta_excels / f"{args.prefijo}CONSOLIDADO.xlsx"
-        n_total = guardar_excel(todos_los_datos, nombre_consolidado)
+        n_total = guardar_excel(todos_los_datos, nombre_consolidado, log=todos_los_logs)  # <-- NUEVO: pasa el log consolidado
         print(f"\nConsolidado: {n_total} filas totales -> {nombre_consolidado.name}")
 
     print("\n" + "-" * 50)

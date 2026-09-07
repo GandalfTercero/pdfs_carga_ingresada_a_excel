@@ -9,6 +9,23 @@ import re
 from src.constantes import COLUMNAS
 
 
+# Diccionario de correcciones de nombres conocidos (ampliar segun necesites)
+_CORRECCIONES_NOMBRE = {
+    "ALUMINIOSAJR": "ALUMINIOS AJR",
+    "CORVITMEDELLIN": "CORVIT MEDELLIN",
+    "ENTREVIDRIOSLA30": "ENTREVIDRIOS LA 30",
+}
+
+# Correcciones de descripcion
+_CORRECCIONES_DESC = {
+    "10M": "10MM",
+    "8M": "8MM",
+    "6M": "6MM",
+    "5M": "5MM",
+    "4M": "4MM",
+}
+
+
 def es_numero_puro(token):
     """
     True si el token es un numero valido de medida.
@@ -69,6 +86,38 @@ def separar_numero_palabra(token):
     return None
 
 
+def _convertir_fecha_serial(token):
+    """Convierte fecha serial de Excel (ej: 46248,41547) a dd/mm/yyyy."""
+    try:
+        import datetime
+        numero = float(token.replace(',', '.'))
+        base = datetime.datetime(1899, 12, 30)
+        fecha = base + datetime.timedelta(days=numero)
+        return fecha.strftime('%d/%m/%Y')
+    except Exception:
+        return token
+
+
+def _limpiar_nombre_cliente(nombre):
+    """Aplica correcciones conocidas y separa S.A.S / S.A. / LTDA."""
+    # Correcciones especificas del diccionario
+    for mal, bien in _CORRECCIONES_NOMBRE.items():
+        nombre = nombre.replace(mal, bien)
+
+    # Separar extensiones juridicas pegadas
+    nombre = re.sub(r'([A-Za-z])(S\.A\.S)', r'\1 \2', nombre)
+    nombre = re.sub(r'([A-Za-z])(S\.A\.)', r'\1 \2', nombre)
+    nombre = re.sub(r'([A-Za-z])(LTDA)', r'\1 \2', nombre)
+    return nombre.strip()
+
+
+def _limpiar_descripcion(desc):
+    """Normaliza typos de espesor (10M -> 10MM)."""
+    for mal, bien in _CORRECCIONES_DESC.items():
+        desc = desc.replace(mal, bien)
+    return desc
+
+
 def encontrar_municipio(tokens):
     """
     Encuentra el indice del municipio en la lista de tokens.
@@ -76,12 +125,24 @@ def encontrar_municipio(tokens):
       - Contiene letras, o
       - Es una fecha con slash, o
       - Es una fecha serial larga (5+ digitos antes de la coma)
+    Devuelve: (indice_mun, tokens_corregidos, fechas_encontradas)
     """
     tokens_corregidos = list(tokens)
+    fechas = []
 
     for i, token in enumerate(tokens):
         if i == 0:
             continue  # CANT siempre es numerico
+
+        # Fecha con slash -> la guardamos y seguimos (puede haber dos)
+        if re.match(r'\d{2}/\d{2}/\d{4}', token):
+            fechas.append(token)
+            continue
+
+        # Fecha serial de Excel (5+ digitos, coma, decimales)
+        if re.match(r'\d{5,},\d+', token):
+            fechas.append(_convertir_fecha_serial(token))
+            continue
 
         # Si tiene letras, es el municipio (o numero pegado a municipio)
         if re.search(r'[A-Za-z]', token):
@@ -91,24 +152,16 @@ def encontrar_municipio(tokens):
                 tokens_corregidos = (tokens_corregidos[:i] +
                                      [num, palabra] +
                                      tokens_corregidos[i+1:])
-                return i + 1, tokens_corregidos
-            return i, tokens_corregidos
+                return i + 1, tokens_corregidos, fechas
+            return i, tokens_corregidos, fechas
 
-        # Fecha con slash -> parte de la cola
-        if re.match(r'\d{2}/\d{2}/\d{4}', token):
-            return i, tokens_corregidos
-
-        # Fecha serial de Excel (5+ digitos, coma, decimales)
-        if re.match(r'\d{5,},\d+', token):
-            return i, tokens_corregidos
-
-    return len(tokens), tokens_corregidos
+    return len(tokens), tokens_corregidos, fechas
 
 
 def parsear_linea(linea):
     """
     Toma UNA linea de texto del PDF y devuelve un diccionario
-    con las 8 columnas. Si la linea no es un pedido valido, devuelve None.
+    con las columnas. Si la linea no es un pedido valido, devuelve None.
     """
     linea = limpiar_linea(linea)
 
@@ -119,33 +172,38 @@ def parsear_linea(linea):
     op = op_match.group(1)
     resto = linea[op_match.end():]
 
-    # Paso 2: Buscar ITEM + DESCRIPCION
-    desc_match = re.search(r'(\d+)(TEMP\s+(?:\w+\s+)*\d+MM)', resto)
-    if not desc_match:
-        return None
+    # Paso 2: Buscar ITEM + DESCRIPCION (ITEM puede estar vacio)
+    desc_match = re.search(r'(\d+)(TEMP\s+(?:\w+\s+)*\d+M{1,2})', resto)
+    item = ""
+    if desc_match:
+        item = desc_match.group(1)
+        desc = desc_match.group(2)
+        nombre = resto[:desc_match.start()].strip()
+        despues = resto[desc_match.end():].strip()
+    else:
+        # Caso sin ITEM (ej: ||TEMP INCOL 8MM|)
+        desc_match = re.search(r'(TEMP\s+(?:\w+\s+)*\d+M{1,2})', resto)
+        if not desc_match:
+            return None
+        desc = desc_match.group(1)
+        nombre = resto[:desc_match.start()].strip()
+        despues = resto[desc_match.end():].strip()
 
-    item = desc_match.group(1)
-    desc = desc_match.group(2)
-    nombre = resto[:desc_match.start()].strip()
-    despues = resto[desc_match.end():].strip()
     tokens = despues.split()
-
-    if len(tokens) < 4:
+    if len(tokens) < 3:
         return None
 
-    # Paso 3: Encontrar donde esta el municipio
-    indice_mun, tokens = encontrar_municipio(tokens)
+    # Paso 3: Encontrar donde esta el municipio y capturar fechas
+    indice_mun, tokens, fechas = encontrar_municipio(tokens)
 
     # Paso 4: Reconstruir segun la posicion del municipio
     if indice_mun == 4:
-        # Caso normal: CANT, ANCHO, ALTO, PESO, MUNICIPIO
         cant = tokens[0]
         ancho = tokens[1]
         alto = tokens[2]
         peso = tokens[3]
 
     elif indice_mun == 3:
-        # Solo 3 tokens numericos antes del municipio
         sep_dc = separar_doble_coma(tokens[1])
         if sep_dc:
             cant = tokens[0]
@@ -158,15 +216,17 @@ def parsear_linea(linea):
                 ancho, alto = sep_ed
                 peso = tokens[2]
             else:
-                cant = tokens[0]
-                ancho = tokens[1]
-                alto = tokens[2]
-                peso = ""
+                # Falta un numero: asumimos CANT=1, o usamos los 3 tal cual
+                cant = "1"
+                ancho = tokens[0]
+                alto = tokens[1]
+                peso = tokens[2]
 
     elif indice_mun == 2:
-        cant = tokens[0]
-        ancho = tokens[1]
-        alto = ""
+        # Faltan dos numeros
+        cant = "1"
+        ancho = tokens[0]
+        alto = tokens[1]
         peso = ""
 
     else:
@@ -175,26 +235,74 @@ def parsear_linea(linea):
         alto = tokens[2] if len(tokens) > 2 else ""
         peso = tokens[3] if len(tokens) > 3 else ""
 
+    # Asignar fechas (maximo 2)
+    fecha_op = fechas[0] if len(fechas) > 0 else ""
+    fecha_sol = fechas[1] if len(fechas) > 1 else ""
+
     return {
         'O.P': op,
-        'RAZON SOCIAL': nombre,
+        'RAZON SOCIAL': _limpiar_nombre_cliente(nombre),
         'ITEM': item,
-        'DESCRIPCION': desc,
+        'DESCRIPCION': _limpiar_descripcion(desc),
         'CANT': cant,
         'ANCHO': ancho,
         'ALTO': alto,
-        'PESO': peso
+        'PESO': peso,
+        'FECHA_O_P': fecha_op,
+        'FECHA_SOL_DESPACHO': fecha_sol,
     }
 
 
-def parsear_paginas(lista_paginas):
+def parsear_paginas(lista_paginas, log=None):
     """
     Toma una lista de paginas (texto) y devuelve una lista de diccionarios.
+    Si se pasa 'log' (lista), acumula errores y advertencias.
     """
     filas = []
+    ultimo_item_por_op = {}  # Para completar ITEMs vacios
+
     for pagina in lista_paginas:
         for linea in pagina.strip().split('\n'):
-            fila = parsear_linea(linea)
+            linea_limpia = linea.strip()
+            if not linea_limpia:
+                continue
+
+            fila = parsear_linea(linea_limpia)
+
             if fila:
+                op = fila['O.P']
+
+                # Completar ITEM vacio con secuencia
+                if fila['ITEM'] == "":
+                    ultimo_item_por_op[op] = ultimo_item_por_op.get(op, 0) + 1
+                    fila['ITEM'] = str(ultimo_item_por_op[op])
+                else:
+                    try:
+                        ultimo_item_por_op[op] = int(fila['ITEM'])
+                    except ValueError:
+                        pass
+
+                # Detectar campos vacios sospechosos
+                campos_numericos = ['CANT', 'ANCHO', 'ALTO', 'PESO']
+                vacios = [c for c in campos_numericos if fila.get(c) == ""]
+                if vacios and log is not None:
+                    log.append({
+                        'tipo': 'sospechoso',
+                        'detalle': f"Campos vacios: {', '.join(vacios)}",
+                        'linea': linea_limpia,
+                        'op': op,
+                        'item': fila['ITEM']
+                    })
+
                 filas.append(fila)
+            else:
+                if log is not None:
+                    log.append({
+                        'tipo': 'ignorada',
+                        'detalle': 'No coincidio con el patron de pedido',
+                        'linea': linea_limpia,
+                        'op': '',
+                        'item': ''
+                    })
+
     return filas
